@@ -1,15 +1,76 @@
 #!/usr/bin/env python
 #encoding: utf-8
 
+import os
 import logging
 import time
 import json
 import socket
 import subprocess
 import random
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import PKCS1_OAEP
+from Crypto.Cipher import AES
+import base64
+import copy
+from traceback import format_exc
 
 
 HOSTNAME = socket.getfqdn()
+AES_SIZE = 16
+PADDING_BYTE = '0'
+
+
+############ Encription helpers ######################
+def pad(msg):
+    msg = msg.encode('utf-8')
+    return msg + (AES_SIZE - len(msg) % AES_SIZE) * PADDING_BYTE
+
+
+def unpad(msg):
+    while msg[-1] == PADDING_BYTE:
+        msg = msg[:-1]
+    return msg
+
+
+def encryptRSA(msg, key):
+    cipher = PKCS1_OAEP.new(key)
+    return base64.b64encode(cipher.encrypt(msg))
+
+
+def encryptAES(msg, key):
+    cipher = AES.new(key)
+    return base64.b64encode(cipher.encrypt(msg))
+
+
+def decryptRSA(msg, key):
+    cipher = PKCS1_OAEP.new(key)
+    return cipher.decrypt(base64.b64decode(msg))
+
+
+def decryptAES(msg, key):
+    cipher = AES.new(key)
+    return cipher.decrypt(base64.b64decode(msg))
+
+
+def wrap(dict_obj, key):
+    logging.debug('Wrapping: %r' % dict_obj)
+    payload = json.dumps(dict_obj)
+    aes_key = os.urandom(AES_SIZE)
+    res = {}
+    res['payload'] = encryptAES(pad(payload), aes_key)
+    res['key'] = encryptRSA(aes_key, key)
+    logging.debug('Wrapped: %r' % res)
+    return res
+
+
+def unwrap(dict_obj, key):
+    logging.debug('Unwrapping %s' % dict_obj)
+    aes_key = decryptRSA(dict_obj['key'], key)
+    payload = decryptAES(dict_obj['payload'], aes_key)
+    res = json.loads(unpad(payload))
+    logging.debug('Unwrapped: %s' % res)
+    return res
 
 
 #### Messages and related classes ####################
@@ -18,28 +79,50 @@ class MalformedMessage(Exception):
 
 
 class Message(dict):
-    def __init__(self, m_type, token, **kwargs):
+    def __init__(self, m_type, token, priv_key, pub_key, **kwargs):
         self['token'] = token
         self['m_type'] = m_type
+        self.priv_key = priv_key
+        self.pub_key = pub_key
 
     def __str__(self):
-        return json.dumps(self)
+        signed_message = {}
+        signed_message['data'] = json.dumps(self)
+        signed_message['signature'] = \
+            self.priv_key.sign(signed_message['data'], '')[0]
+        signed_message['host'] = HOSTNAME
+        signed_message['pub_key'] = \
+            self.priv_key.publickey().exportKey(format='OpenSSH')
+        return json.dumps(wrap(signed_message, self.pub_key))
 
     @classmethod
-    def from_str(cls, cmd_str):
+    def from_str(cls, msg_str, priv_key, **kwargs):
         try:
-            cmd_dict = json.loads(cmd_str)
-            return cls(**cmd_dict)
+            msg_dict = json.loads(msg_str)
+            unwrapped_msg_dict = unwrap(msg_dict, priv_key)
+            ## TODO: verify the sent pub_key
+            pub_key = RSA.importKey(unwrapped_msg_dict['pub_key'])
+            signature = unwrapped_msg_dict['signature']
+            if not pub_key.verify(str(unwrapped_msg_dict['data']),
+                                  (signature, )):
+                raise ValueError('Wrong signature')
+            kwargs.update(json.loads(unwrapped_msg_dict['data']))
+            kwargs['pub_key'] = pub_key
+            kwargs['priv_key'] = priv_key
+            print kwargs
+            return cls(**kwargs)
         except (ValueError, TypeError) as exc:
-            raise MalformedMessage('%s\n%s' % (cmd_str, exc))
+            raise MalformedMessage('%s\n%s' % (msg_str, format_exc(exc)))
 
 
-class Token(Message):
-    def __init__(self, token=None, **kwargs):
-        self.token = token or self.generate_token()
-        if 'm_type' in kwargs:
-            kwargs.pop('m_type')
-        super(Token, self).__init__('token', self.token, **kwargs)
+class Token(dict):
+    def __init__(self, key, token=None, **kwargs):
+        self.key = key
+        self['pub_key'] = key.publickey().exportKey(format='OpenSSH')
+        self['token'] = token \
+            and decryptRSA(token, key) \
+            or self.generate_token()
+        self['m_type'] = 'token'
         self['host'] = HOSTNAME
 
     @staticmethod
@@ -48,40 +131,57 @@ class Token(Message):
         ts = repr(time.time()).replace('.', '')
         return rand + ts
 
+    def __str__(self):
+        new_token = copy.deepcopy(self)
+        new_token['token'] = encryptRSA(new_token['token'], self.key)
+        return json.dumps(new_token)
+
+    @classmethod
+    def from_str(cls, msg_str, **kwargs):
+        try:
+            msg_dict = json.loads(msg_str)
+            kwargs.update(msg_dict)
+            return cls(**kwargs)
+        except (ValueError, TypeError) as exc:
+            raise MalformedMessage('%s\n%s' % (msg_str, format_exc(exc)))
+
 
 class BadToken(Message):
-    def __init__(self, token, **kwargs):
+    def __init__(self, token, priv_key, pub_key, **kwargs):
         if 'm_type' in kwargs:
             kwargs.pop('m_type')
-        super(BadToken, self).__init__('bad_token', token, **kwargs)
+        super(BadToken, self).__init__('bad_token', token,
+                                       priv_key, pub_key, **kwargs)
         self['m_type'] = 'bad_token'
         self['host'] = HOSTNAME
 
 
 class CommandRequest(Message):
-    def __init__(self, token, command, return_queue, **kwargs):
+    def __init__(self, token, priv_key, pub_key, command,
+                 return_queue, **kwargs):
         if 'm_type' in kwargs:
             kwargs.pop('m_type')
         super(CommandRequest, self).__init__('command_request', token,
-                                             **kwargs)
+                                             priv_key, pub_key, **kwargs)
         self['command'] = command
         self['return_queue'] = return_queue
         self['m_type'] = 'command_request'
 
 
 class CommandResult(Message):
-    def __init__(self, token, command, return_queue,
+    def __init__(self, token, priv_key, pub_key, command, return_queue,
                  rc='', stdout='', stderr='', host=HOSTNAME, **kwargs):
         if 'm_type' in kwargs:
             kwargs.pop('m_type')
-        super(CommandResult, self).__init__('command_result', token, **kwargs)
+        super(CommandResult, self).__init__('command_result', token,
+                                            priv_key, pub_key, **kwargs)
         self['token'] = token
         self['command'] = command
-        self['host'] = host
         self['return_queue'] = return_queue
         self['rc'] = rc
         self['stdout'] = stdout
         self['stderr'] = stderr
+        self['host'] = HOSTNAME
         self.finished = False
         self.proc = None
 
@@ -110,38 +210,56 @@ MSG_TYPES = {
 }
 
 
-def to_message(str_msg):
+def to_message(str_msg, priv_key, pub_keys=None):
     try:
-        dict_obj = json.loads(str_msg)
-        return MSG_TYPES[dict_obj['m_type']](**dict_obj)
+        str_msg = unwrap(json.loads(str_msg), priv_key)
+        if not pub_keys:
+            ## TODO: verify pub_key
+            pub_key = RSA.importKey(str_msg['pub_key']).publickey()
+        else:
+            pub_key = pub_keys[str_msg['host']]
+        signature = str_msg['signature']
+        if not pub_key.verify(str(str_msg['data']), (signature, )):
+            raise ValueError('Wrong signature')
+        msg = json.loads(str_msg['data'])
+        msg['pub_key'] = pub_key
+        msg['priv_key'] = priv_key
+        return MSG_TYPES[msg['m_type']](**msg)
     except ValueError as exc:
         raise MalformedMessage('Unable to parse json: %s\n%s'
-                               % (str_msg, exc))
+                               % (str_msg, format_exc(exc)))
+    except KeyError as exc:
+        raise MalformedMessage('Unknown message type: %s\n%s'
+                               % (str_msg, format_exc(exc)))
     except TypeError as exc:
         raise MalformedMessage('Missing or duplicate fields: %s\n%s'
-                               % (str_msg, exc))
+                               % (str_msg, format_exc(exc)))
 
 
 ######## Helper methods and classes #########################
 class CommandPool(object):
-    def __init__(self, conn, max_commands=2):
-        self.max_commands = 2
+    def __init__(self, conn, key, max_procs=2):
+        self.max_procs = 2
         self.pool = {}
         self.conn = conn
+        self.key = key
         self.init_poll()
 
     def init_poll(self):
-        for _ in range(self.max_commands):
-            new_token = Token()
-            self.pool[new_token.token] = None
+        for _ in range(self.max_procs):
+            new_token = Token(key=self.key)
+            self.pool[new_token['token']] = None
             self.send_token(new_token)
 
     def send_token(self, token):
             self.send_msg(token, '/queue/ctrl_%s' % HOSTNAME)
 
-    def send_bad_token(self, token, ret_queue):
-        bad_token = BadToken(token)
-        self.send_msg(bad_token, ret_queue)
+    def send_bad_token(self, token, cmd_req):
+        bad_token = BadToken(
+            token,
+            priv_key=self.key,
+            pub_key=cmd_req.pub_key)
+        self.send_msg(bad_token, cmd_req['return_queue'])
 
     def send_result(self, cmd):
         cmd.parse_results()
@@ -156,19 +274,19 @@ class CommandPool(object):
             self.send_result(self.pool[token])
             del self.pool[token]
             ## generate a new token and clear executor slot
-            new_token = Token()
-            self.pool[new_token.token] = None
+            new_token = Token(key=self.key)
+            self.pool[new_token['token']] = None
             self.send_token(new_token)
 
     def add_command(self, cmd_req):
         token = cmd_req['token']
         if token in self.pool and not self.pool[token]:
-            cmd_res = CommandResult.from_str(str(cmd_req))
+            cmd_res = CommandResult.from_str(str(cmd_req), self.key)
             cmd_res.run()
             self.pool[token] = cmd_res
         elif token not in self.pool:
-            logging.warn("Received a bad token: %s" % cmd_req)
-            self.send_bad_token(token, cmd_req['return_queue'])
+            logging.warn("Received a bad token: %r" % cmd_req)
+            self.send_bad_token(token, cmd_req)
 
     def send_msg(self, msg, queue):
         self.conn.send(str(msg), destination=queue)
@@ -222,6 +340,13 @@ def show_summary(results, hosts):
 
 ######### Listener classes ###############################
 class BaseListener():
+    def load_keys(self, key_path):
+        if key_path is None:
+            key_path = os.path.expanduser('~/.ssh/id_rsa')
+        if not os.path.exists(key_path):
+            raise Exception('Unable to lad key %s, file not found' % key_path)
+        self.key = RSA.importKey(open(key_path))
+
     def start_conn(self):
         self.conn.set_listener('', self)
         self.conn.start()
@@ -239,14 +364,18 @@ class BaseListener():
 
 
 class ServerListener(BaseListener):
-    def __init__(self, server, port, conn, max_procs=2):
+    def __init__(self, server, port, conn, key_path=None, max_procs=2):
         self.server = server
         self.port = port
         self.conn = conn
         self.tokens = []
 
+        self.load_keys(key_path)
         self.start_conn()
-        self.pool = CommandPool(conn, max_procs)
+        self.pool = CommandPool(
+            conn=conn,
+            max_procs=max_procs,
+            key=self.key)
         in_queue = '/queue/in_%s' % HOSTNAME
         self.conn.subscribe(destination=in_queue, ack='auto')
 
@@ -256,21 +385,24 @@ class ServerListener(BaseListener):
     def on_message(self, headers, message):
         logging.info("Got command: %s" % message)
         try:
-            cmd_req = to_message(message)
+            cmd_req = to_message(message, self.key)
         except MalformedMessage as exc:
             logging.error('Unalbe to process command %s: %s'
-                          % (message, exc))
+                          % (message, format_exc(exc)))
             return
         self.pool.add_command(cmd_req)
 
 
 class ClientListener(BaseListener):
-    def __init__(self, server, port, command, conn, hosts):
+    def __init__(self, server, port, command, conn, hosts, key_path=None):
         self.server = server
         self.port = port
         self.conn = conn
         self.return_queue = '/queue/return_%s' % HOSTNAME
         self.command = command
+        self.pub_keys = {}
+
+        self.load_keys(key_path)
         self.hosts = {h: None for h in hosts}
         self.results = {}
         self.start_conn()
@@ -288,11 +420,14 @@ class ClientListener(BaseListener):
         ## this should not happen, but just in case
         if not self.hosts[host] == 'wait_for_token':
             return
-        token_msg = to_message(message)
+        token_msg = Token.from_str(message, key=self.key)
         logging.info("::%s::Got token: %s, sending command"
                      % (host, token_msg['token']))
+        self.pub_keys[host] = RSA.importKey(token_msg['pub_key']).publickey()
         command = CommandRequest(command=self.command,
                                  token=token_msg['token'],
+                                 priv_key=self.key,
+                                 pub_key=self.pub_keys[host],
                                  return_queue=self.return_queue)
         in_queue = '/queue/in_%s' % host
         self.conn.send(str(command), destination=in_queue)
@@ -306,10 +441,10 @@ class ClientListener(BaseListener):
     def handle_result(self, headers, message):
         logging.info('Got response %s' % message)
         try:
-            message = to_message(message)
+            message = to_message(message, self.key, self.pub_keys)
         except MalformedMessage as exc:
             logging.warn('Unable to parse response %s: %s'
-                         % (message, exc))
+                         % (message, format_exc(exc)))
             return
         ## check if the message was meant to us (this process)
         if message['host'] not in self.hosts:
