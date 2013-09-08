@@ -1,0 +1,40 @@
+#!/usr/bin/env python
+#encoding: utf-8
+
+import os
+import argparse
+import logging
+import stomp
+import time
+from mssh import ServerListener
+
+
+def main(server='localhost', port=61613, user=None, passcode=None):
+    logging.info("Starting server, connected to STOMP server %s:%d"
+                 % (server, port))
+    if user:
+        client = stomp.Connection([(server, port)])
+    else:
+        client = stomp.Connection([(server, port)],
+                                  user=user, passcode=passcode)
+    listener = ServerListener(server, port, client)
+    while not os.path.exists('/tmp/stop'):
+        time.sleep(1)
+        listener.poll()
+
+
+def create_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--stomp-server',
+                        default='localhost',
+                        help='STOMP server to connect to.')
+    parser.add_argument('--stomp-port',
+                        default=61613, type=int,
+                        help='STOMP port to connect to.')
+    return parser
+
+if __name__ == '__main__':
+    parser = create_parser()
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.DEBUG)
+    main(args.stomp_server, args.stomp_port)
