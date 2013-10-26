@@ -9,8 +9,12 @@ import socket
 import subprocess
 import random
 from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_OAEP
-from Crypto.Cipher import AES
+from Crypto.Cipher import (
+    PKCS1_OAEP,
+    AES,
+)
+from Crypto.Signature import PKCS1_PSS
+from Crypto.Hash.SHA import SHA1Hash
 import base64
 import copy
 from traceback import format_exc
@@ -31,6 +35,18 @@ def unpad(msg):
     while msg[-1] == PADDING_BYTE:
         msg = msg[:-1]
     return msg
+
+
+def verifyRSA(msg, key, signature):
+    msg_hash = SHA1Hash(msg)
+    cipher = PKCS1_PSS.new(key)
+    return cipher.verify(msg_hash, base64.b64decode(signature)) and msg
+
+
+def signRSA(msg, key):
+    msg_hash = SHA1Hash(msg)
+    cipher = PKCS1_PSS.new(key)
+    return base64.b64encode(cipher.sign(msg_hash))
 
 
 def encryptRSA(msg, key):
@@ -88,23 +104,29 @@ class Message(dict):
     def __str__(self):
         signed_message = {}
         signed_message['data'] = json.dumps(self)
-        signed_message['signature'] = \
-            self.priv_key.sign(signed_message['data'], '')[0]
+        signed_message['signature'] = signRSA(signed_message['data'],
+                                              self.priv_key)
         signed_message['host'] = HOSTNAME
         signed_message['pub_key'] = \
             self.priv_key.publickey().exportKey(format='OpenSSH')
+        logging.debug("Wrapping message with key %s"
+                      % self.pub_key.exportKey(format='OpenSSH'))
         return json.dumps(wrap(signed_message, self.pub_key))
 
     @classmethod
-    def from_str(cls, msg_str, priv_key, **kwargs):
+    def from_str(cls, msg_str, priv_key=None, **kwargs):
         try:
             msg_dict = json.loads(msg_str)
-            unwrapped_msg_dict = unwrap(msg_dict, priv_key)
+            if priv_key:
+                unwrapped_msg_dict = unwrap(msg_dict, priv_key)
+            else:
+                unwrapped_msg_dict = msg_dict
             ## TODO: verify the sent pub_key
             pub_key = RSA.importKey(unwrapped_msg_dict['pub_key'])
             signature = unwrapped_msg_dict['signature']
-            if not pub_key.verify(str(unwrapped_msg_dict['data']),
-                                  (signature, )):
+            if not verifyRSA(str(unwrapped_msg_dict['data']),
+                             pub_key,
+                             signature):
                 raise ValueError('Wrong signature')
             kwargs.update(json.loads(unwrapped_msg_dict['data']))
             kwargs['pub_key'] = pub_key
@@ -116,14 +138,16 @@ class Message(dict):
 
 
 class Token(dict):
-    def __init__(self, key, token=None, **kwargs):
-        self.key = key
-        self['pub_key'] = key.publickey().exportKey(format='OpenSSH')
+    def __init__(self, pub_key, token=None, **kwargs):
+        if isinstance(pub_key, unicode):
+            pub_key = RSA.importKey(pub_key)
+        self.key = pub_key
+        self['pub_key'] = pub_key.publickey().exportKey(format='OpenSSH')
         self['token'] = token \
-            and decryptRSA(token, key) \
+            and verifyRSA(token, pub_key, kwargs['signature']) \
             or self.generate_token()
         self['m_type'] = 'token'
-        self['host'] = HOSTNAME
+        self['host'] = kwargs.get('host', HOSTNAME)
 
     @staticmethod
     def generate_token():
@@ -133,7 +157,7 @@ class Token(dict):
 
     def __str__(self):
         new_token = copy.deepcopy(self)
-        new_token['token'] = encryptRSA(new_token['token'], self.key)
+        new_token['signature'] = signRSA(new_token['token'], self.key)
         return json.dumps(new_token)
 
     @classmethod
@@ -181,7 +205,7 @@ class CommandResult(Message):
         self['rc'] = rc
         self['stdout'] = stdout
         self['stderr'] = stderr
-        self['host'] = HOSTNAME
+        self['host'] = host
         self.finished = False
         self.proc = None
 
@@ -201,6 +225,12 @@ class CommandResult(Message):
     def __getattr__(self, name):
         return getattr(self.proc, name)
 
+    @classmethod
+    def from_cmd_req(cls, cmd_req):
+        priv_key = cmd_req.priv_key
+        pub_key = cmd_req.pub_key
+        return cls(priv_key=priv_key, pub_key=pub_key, **cmd_req)
+
 
 MSG_TYPES = {
     'command_result': CommandResult,
@@ -215,11 +245,11 @@ def to_message(str_msg, priv_key, pub_keys=None):
         str_msg = unwrap(json.loads(str_msg), priv_key)
         if not pub_keys:
             ## TODO: verify pub_key
-            pub_key = RSA.importKey(str_msg['pub_key']).publickey()
+            pub_key = RSA.importKey(str_msg['pub_key'])
         else:
             pub_key = pub_keys[str_msg['host']]
         signature = str_msg['signature']
-        if not pub_key.verify(str(str_msg['data']), (signature, )):
+        if not verifyRSA(str_msg['data'], pub_key, signature):
             raise ValueError('Wrong signature')
         msg = json.loads(str_msg['data'])
         msg['pub_key'] = pub_key
@@ -247,7 +277,7 @@ class CommandPool(object):
 
     def init_poll(self):
         for _ in range(self.max_procs):
-            new_token = Token(key=self.key)
+            new_token = Token(pub_key=self.key)
             self.pool[new_token['token']] = None
             self.send_token(new_token)
 
@@ -274,15 +304,16 @@ class CommandPool(object):
             self.send_result(self.pool[token])
             del self.pool[token]
             ## generate a new token and clear executor slot
-            new_token = Token(key=self.key)
+            new_token = Token(pub_key=self.key)
             self.pool[new_token['token']] = None
             self.send_token(new_token)
 
     def add_command(self, cmd_req):
         token = cmd_req['token']
         if token in self.pool and not self.pool[token]:
-            cmd_res = CommandResult.from_str(str(cmd_req), self.key)
+            cmd_res = CommandResult.from_cmd_req(cmd_req)
             cmd_res.run()
+            logging.debug('Running command "%s"' % cmd_res['command'])
             self.pool[token] = cmd_res
         elif token not in self.pool:
             logging.warn("Received a bad token: %r" % cmd_req)
@@ -328,7 +359,6 @@ def show_summary(results, hosts):
     global_rc = 0
     for host in hosts:
         if host in results:
-            print results[host]
             if results[host]['rc']:
                 print "%s::error" % host
             else:
@@ -403,11 +433,12 @@ class ClientListener(BaseListener):
         self.pub_keys = {}
 
         self.load_keys(key_path)
-        self.hosts = {h: None for h in hosts}
+        self.hosts = dict((h, None) for h in hosts)
         self.results = {}
         self.start_conn()
         self.subscribe_for_tokens()
         self.finished = False
+        self.listening = False
 
     def subscribe_for_tokens(self):
         for host in self.hosts.iterkeys():
@@ -423,7 +454,7 @@ class ClientListener(BaseListener):
         token_msg = Token.from_str(message, key=self.key)
         logging.info("::%s::Got token: %s, sending command"
                      % (host, token_msg['token']))
-        self.pub_keys[host] = RSA.importKey(token_msg['pub_key']).publickey()
+        self.pub_keys[host] = RSA.importKey(token_msg['pub_key'])
         command = CommandRequest(command=self.command,
                                  token=token_msg['token'],
                                  priv_key=self.key,
@@ -433,8 +464,10 @@ class ClientListener(BaseListener):
         self.conn.send(str(command), destination=in_queue)
         self.conn.ack({'message-id': headers['message-id']})
         self.conn.unsubscribe(destination='/queue/ctrl_%s' % host)
-        self.conn.subscribe(destination=self.return_queue,
-                            ack='client-individual')
+        if not self.listening:
+            self.listening = True
+            self.conn.subscribe(destination=self.return_queue,
+                                ack='client-individual')
         logging.debug('::%s::Command sent, waiting for response' % host)
         self.hosts[host] = token_msg['token']
 
